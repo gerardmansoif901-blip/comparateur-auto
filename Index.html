@@ -1,0 +1,1976 @@
+<html lang="fr"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            },
+            'XPeng': {
+                'Électrique': [
+                    { model: 'P5', category: 'berline', price: 39990, length: 4808, width: 1840, height: 1520, wheelbase: 2768, trunk: 450, autonomy: '460', weight: 1765 },
+                    { model: 'P7', category: 'berline', price: 49990, length: 4880, width: 1896, height: 1450, wheelbase: 2998, trunk: 440, autonomy: '625', weight: 1985 },
+                    { model: 'G6', category: 'suv', price: 42990, length: 4753, width: 1920, height: 1650, wheelbase: 2890, trunk: 571, autonomy: '570', weight: 1980 },
+                    { model: 'G9', category: 'suv', price: 59990, length: 4891, width: 1937, height: 1680, wheelbase: 2998, trunk: 660, autonomy: '570', weight: 2340 }
+                ]
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Comparateur de Véhicules Électriques</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 10px;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.98);
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+            overflow: hidden;
+            animation: slideUp 0.5s ease-out;
+        }
+
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        h1 {
+            font-size: clamp(1.5rem, 4vw, 2.5rem);
+            font-weight: 700;
+            margin-bottom: 10px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .subtitle {
+            font-size: clamp(0.9rem, 2vw, 1.1rem);
+            opacity: 0.95;
+            position: relative;
+            z-index: 1;
+        }
+
+        .sync-status {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 10px;
+            margin: 15px 20px;
+            border-radius: 10px;
+            text-align: center;
+            font-size: 0.9rem;
+        }
+
+        .sync-status .status-icon {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #4CAF50;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .garage-dimensions {
+            background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+            padding: 15px;
+            margin: 15px;
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }
+
+        .garage-title {
+            font-weight: 600;
+            color: #2c3e50;
+            margin-bottom: 10px;
+            text-align: center;
+            font-size: 1rem;
+        }
+
+        .garage-inputs {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .garage-input-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background: white;
+            padding: 10px 15px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+
+        .garage-input-group label {
+            font-size: 0.8rem;
+            color: #666;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+
+        .garage-input-group input {
+            width: 80px;
+            padding: 5px;
+            border: 2px solid #fcb69f;
+            border-radius: 5px;
+            text-align: center;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .garage-input-group input:focus {
+            outline: none;
+            border-color: #ff8c42;
+        }
+
+        .garage-input-group .unit {
+            font-size: 0.75rem;
+            color: #999;
+            margin-top: 3px;
+        }
+
+        .fits-in-garage {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            margin-left: 5px;
+        }
+
+        .fits-yes {
+            background: #84fab0;
+            color: #1a5f3f;
+        }
+
+        .fits-no {
+            background: #fa709a;
+            color: white;
+        }
+
+        .legend {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            padding: 15px;
+            margin: 15px;
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }
+
+        .legend-title {
+            font-weight: 600;
+            color: #2c3e50;
+            margin-bottom: 10px;
+            text-align: center;
+            font-size: 1rem;
+        }
+
+        .legend-items {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 20px;
+            background: white;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            font-size: 0.85rem;
+        }
+
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .legend-green { background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%); }
+        .legend-red { background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); }
+        .legend-garage { background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%); }
+
+        .controls {
+            padding: 15px;
+            background: #f8f9fa;
+            border-top: 1px solid #e9ecef;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .controls-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .btn {
+            padding: 10px 15px;
+            border: none;
+            border-radius: 25px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            touch-action: manipulation;
+            width: 100%;
+        }
+
+        .btn:active {
+            transform: scale(0.95);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            font-size: 0.95rem;
+            padding: 12px 20px;
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
+            color: #1a5f3f;
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+            color: white;
+        }
+
+        .btn-info {
+            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+            color: #2c5282;
+        }
+
+        .btn-warning {
+            background: linear-gradient(135deg, #f6d365 0%, #fda085 100%);
+            color: #7c2e00;
+        }
+
+        .table-wrapper {
+            padding: 15px;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 0 30px rgba(0,0,0,0.08);
+            font-size: 0.8rem;
+        }
+
+        th {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 10px 5px;
+            font-weight: 600;
+            text-align: center;
+            font-size: 0.75rem;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 8px 5px;
+            text-align: center;
+            border-bottom: 1px solid #e9ecef;
+            font-size: 0.75rem;
+            white-space: nowrap;
+        }
+
+        tr:active {
+            background-color: #f0f0ff;
+        }
+
+        .category-row {
+            background: linear-gradient(90deg, #f5f7fa 0%, #c3cfe2 100%);
+            font-weight: 700;
+            color: #2c3e50;
+            font-size: 0.85rem;
+        }
+
+        .category-row td {
+            padding: 12px;
+            border: none;
+        }
+
+        .dimension-green {
+            background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
+            color: #1a5f3f;
+            font-weight: 600;
+        }
+
+        .dimension-red {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+            color: white;
+            font-weight: 600;
+        }
+
+        .garage-warning {
+            background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+            color: #c45500;
+            font-weight: 600;
+        }
+
+        .delete-btn {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 15px;
+            cursor: pointer;
+            font-size: 0.7rem;
+            transition: all 0.3s;
+        }
+
+        .delete-btn:active {
+            transform: scale(0.9);
+        }
+
+        .editable {
+            cursor: pointer;
+            position: relative;
+            transition: all 0.2s;
+        }
+
+        .editable:active {
+            background: rgba(102, 126, 234, 0.1);
+        }
+
+        .edit-input {
+            width: 100%;
+            padding: 5px;
+            border: 2px solid #667eea;
+            border-radius: 5px;
+            font-family: inherit;
+            font-size: inherit;
+            background: white;
+            text-align: center;
+            outline: none;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(5px);
+            animation: fadeIn 0.3s;
+            overflow-y: auto;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .modal-content {
+            background: white;
+            margin: 2% auto;
+            padding: 20px;
+            width: 95%;
+            max-width: 900px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            animation: slideDown 0.3s;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        @keyframes slideDown {
+            from { transform: translateY(-50px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: color 0.3s;
+            padding: 0 5px;
+        }
+
+        .close:active {
+            color: #667eea;
+        }
+
+        .search-section {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+
+        .search-section h3 {
+            color: #2c3e50;
+            margin-bottom: 15px;
+        }
+
+        .search-results {
+            display: none;
+            margin-bottom: 20px;
+        }
+
+        .search-results-header {
+            background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            color: #1a5f3f;
+            font-weight: 600;
+        }
+
+        .vehicles-list {
+            max-height: 350px;
+            overflow-y: auto;
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+        }
+
+        .vehicle-item {
+            display: flex;
+            align-items: center;
+            padding: 12px;
+            background: white;
+            border-radius: 8px;
+            border: 2px solid #e9ecef;
+            margin-bottom: 10px;
+            transition: all 0.2s;
+        }
+
+        .vehicle-item:hover {
+            border-color: #667eea;
+            transform: translateX(5px);
+        }
+
+        .vehicle-item input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            margin-right: 15px;
+            cursor: pointer;
+        }
+
+        .vehicle-item label {
+            cursor: pointer;
+            flex: 1;
+        }
+
+        .vehicle-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .vehicle-main {
+            flex: 1;
+        }
+
+        .vehicle-name {
+            font-weight: 600;
+            color: #2c3e50;
+            margin-bottom: 5px;
+        }
+
+        .vehicle-specs {
+            font-size: 0.8rem;
+            color: #7f8c8d;
+        }
+
+        .vehicle-price {
+            color: #667eea;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #2c3e50;
+            font-size: 0.9rem;
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            transition: border-color 0.3s;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+        }
+
+        .notes {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            padding: 20px;
+            margin: 15px;
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }
+
+        .notes h3 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 1.1rem;
+        }
+
+        .notes ul {
+            list-style: none;
+            padding-left: 0;
+        }
+
+        .notes li {
+            padding: 6px 0;
+            padding-left: 20px;
+            position: relative;
+            font-size: 0.9rem;
+        }
+
+        .notes li::before {
+            content: '🔹';
+            position: absolute;
+            left: 0;
+        }
+
+        .brand-renault { background-color: rgba(255, 234, 167, 0.2); }
+        .brand-tesla { background-color: rgba(240, 248, 255, 0.2); }
+        .brand-volkswagen { background-color: rgba(245, 245, 245, 0.2); }
+        .brand-peugeot { background-color: rgba(255, 250, 205, 0.2); }
+        .brand-byd { background-color: rgba(255, 232, 232, 0.2); }
+        .brand-mg { background-color: rgba(240, 255, 240, 0.2); }
+        .brand-kia { background-color: rgba(255, 239, 213, 0.2); }
+        .brand-bmw { background-color: rgba(230, 240, 255, 0.2); }
+        .brand-mercedes { background-color: rgba(245, 245, 250, 0.2); }
+        .brand-audi { background-color: rgba(250, 240, 240, 0.2); }
+        .brand-hyundai { background-color: rgba(240, 250, 255, 0.2); }
+        .brand-nissan { background-color: rgba(255, 245, 235, 0.2); }
+        .brand-opel { background-color: rgba(255, 250, 240, 0.2); }
+        .brand-citroen { background-color: rgba(255, 240, 240, 0.2); }
+        .brand-citron { background-color: rgba(255, 240, 240, 0.2); }
+        .brand-fiat { background-color: rgba(255, 255, 240, 0.2); }
+        .brand-ford { background-color: rgba(240, 245, 255, 0.2); }
+        .brand-skoda { background-color: rgba(245, 255, 245, 0.2); }
+        .brand-xpeng { background-color: rgba(230, 255, 250, 0.2); }
+
+        .deleted {
+            display: none !important;
+        }
+
+        .manual-section {
+            border-top: 2px solid #e9ecef;
+            padding-top: 20px;
+            margin-top: 20px;
+        }
+
+        /* Styles spécifiques mobile */
+        @media (max-width: 768px) {
+            body { padding: 5px; }
+            .container { border-radius: 15px; }
+            h1 { font-size: 1.5rem; }
+            .subtitle { font-size: 0.9rem; }
+            .legend { margin: 10px; padding: 12px; }
+            .garage-dimensions { margin: 10px; padding: 12px; }
+            .controls { padding: 10px; }
+            .table-wrapper { padding: 10px; }
+            th, td { padding: 6px 3px; font-size: 0.7rem; }
+            .btn { font-size: 0.8rem; padding: 8px 12px; }
+            .modal-content { width: 98%; margin: 2% auto; padding: 15px; }
+            .vehicles-list { max-height: 250px; }
+        }
+
+        @media (max-width: 480px) {
+            .controls-grid { grid-template-columns: 1fr 1fr; }
+            .form-row { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="container">
+        <div class="header">
+            <h1>🚗 Comparateur de Véhicules Électriques</h1>
+            <p class="subtitle">Analysez et comparez les caractéristiques des véhicules</p>
+        </div>
+
+        <div class="sync-status">
+            <span class="status-icon"></span>
+            <span>Session active - Données en mémoire</span>
+        </div>
+
+        <div class="garage-dimensions">
+            <div class="garage-title">🏠 Dimensions de votre garage</div>
+            <div class="garage-inputs">
+                <div class="garage-input-group">
+                    <label>Longueur</label>
+                    <input type="number" id="garageLength" placeholder="5000" onchange="updateGarageDimensions()">
+                    <span class="unit">mm</span>
+                </div>
+                <div class="garage-input-group">
+                    <label>Largeur</label>
+                    <input type="number" id="garageWidth" placeholder="2500" onchange="updateGarageDimensions()">
+                    <span class="unit">mm</span>
+                </div>
+                <div class="garage-input-group">
+                    <label>Hauteur</label>
+                    <input type="number" id="garageHeight" placeholder="2200" onchange="updateGarageDimensions()">
+                    <span class="unit">mm</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="legend">
+            <div class="legend-title">🎨 Code couleur des dimensions</div>
+            <div class="legend-items">
+                <div class="legend-item">
+                    <div class="legend-color legend-green"></div>
+                    <span>Plus compact / Plus de coffre</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color legend-red"></div>
+                    <span>Plus imposant / Moins de coffre</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color legend-garage"></div>
+                    <span>Trop grand pour le garage</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <div style="text-align: center;">
+                <button class="btn btn-primary" onclick="openAddModal()">➕ Ajouter un véhicule</button>
+            </div>
+            <div class="controls-grid">
+                <button class="btn btn-success" onclick="restoreAll()">🔄 Restaurer tout</button>
+                <button class="btn btn-info" onclick="exportData()">📤 Exporter JSON</button>
+                <button class="btn btn-warning" onclick="importData()">📥 Importer JSON</button>
+                <button class="btn btn-info" onclick="saveTable()">💾 Sauvegarder HTML</button>
+            </div>
+        </div>
+
+        <div class="table-wrapper">
+            <table id="vehicleTable">
+                <thead>
+                    <tr>
+                        <th>Action</th>
+                        <th>Type</th>
+                        <th>Marque</th>
+                        <th>Modèle</th>
+                        <th>Année</th>
+                        <th>Prix (€)</th>
+                        <th>Long (mm)</th>
+                        <th>Larg (mm)</th>
+                        <th>Haut (mm)</th>
+                        <th>Empat (mm)</th>
+                        <th>Coffre (L)</th>
+                        <th>Auto (km)</th>
+                        <th>Poids (kg)</th>
+                        <th>Garage</th>
+                    </tr>
+                </thead>
+                <tbody id="tableBody"></tbody>
+            </table>
+        </div>
+
+        <div class="notes">
+            <h3>📋 Notes importantes</h3>
+            <ul>
+                <li><strong>Garage :</strong> Définissez les dimensions de votre garage pour voir quels véhicules y rentrent</li>
+                <li><strong>Recherche :</strong> Trouvez facilement des véhicules par marque et type</li>
+                <li><strong>Sélection multiple :</strong> Ajoutez plusieurs véhicules en une fois</li>
+                <li><strong>Synchronisation :</strong> Les données sont stockées en mémoire pendant la session</li>
+                <li><strong>Sauvegarde :</strong> Utilisez "Exporter JSON" pour sauvegarder vos modifications</li>
+                <li><strong>Édition :</strong> Touchez les cellules pour modifier les valeurs</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- Modal d'ajout de véhicule -->
+    <div id="addModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeAddModal()">×</span>
+            <h2 style="color: #667eea; margin-bottom: 20px;">➕ Ajouter des véhicules</h2>
+            
+            <!-- Section de recherche -->
+            <div class="search-section">
+                <h3>🔍 Recherche de véhicules</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Type de véhicule *</label>
+                        <select id="searchType" required>
+                            <option value="">-- Sélectionner --</option>
+                            <option value="Électrique">Électrique</option>
+                            <option value="Hybride">Hybride</option>
+                            <option value="Hybride rechargeable">Hybride rechargeable</option>
+                            <option value="Essence">Essence</option>
+                            <option value="Diesel">Diesel</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Marque *</label>
+                        <select id="searchBrand" required>
+                            <option value="">-- Sélectionner --</option>
+                            <option value="Renault">Renault</option>
+                            <option value="Peugeot">Peugeot</option>
+                            <option value="Tesla">Tesla</option>
+                            <option value="Volkswagen">Volkswagen</option>
+                            <option value="BMW">BMW</option>
+                            <option value="Mercedes">Mercedes</option>
+                            <option value="Audi">Audi</option>
+                            <option value="Hyundai">Hyundai</option>
+                            <option value="Kia">Kia</option>
+                            <option value="BYD">BYD</option>
+                            <option value="MG">MG</option>
+                            <option value="Nissan">Nissan</option>
+                            <option value="Opel">Opel</option>
+                            <option value="Citroën">Citroën</option>
+                            <option value="Fiat">Fiat</option>
+                            <option value="Ford">Ford</option>
+                            <option value="Skoda">Skoda</option>
+                            <option value="XPeng">XPeng</option>
+                        </select>
+                    </div>
+                </div>
+                <button class="btn btn-primary" style="width: 100%; margin-top: 10px;" onclick="searchVehicles()">
+                    🔎 Rechercher les véhicules disponibles
+                </button>
+            </div>
+
+            <!-- Résultats de recherche -->
+            <div id="searchResults" class="search-results">
+                <h3 style="color: #2c3e50; margin-bottom: 15px;">📋 Véhicules trouvés</h3>
+                <div id="searchResultsHeader" class="search-results-header"></div>
+                <div id="vehiclesList" class="vehicles-list"></div>
+                <div style="text-align: center; margin-top: 15px;">
+                    <button class="btn btn-info" onclick="selectAllVehicles()">
+                        ☑️ Tout sélectionner
+                    </button>
+                    <button class="btn btn-success" onclick="addSelectedVehicles()">
+                        ✅ Ajouter les véhicules sélectionnés
+                    </button>
+                </div>
+            </div>
+
+            <!-- Formulaire manuel -->
+            <div class="manual-section">
+                <h3 style="color: #2c3e50; margin-bottom: 15px;">✏️ Ajout manuel</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Type de véhicule</label>
+                        <select id="vehicleType">
+                            <option value="Électrique">Électrique</option>
+                            <option value="Hybride">Hybride</option>
+                            <option value="Hybride rechargeable">Hybride rechargeable</option>
+                            <option value="Essence">Essence</option>
+                            <option value="Diesel">Diesel</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Catégorie</label>
+                        <select id="vehicleCategory">
+                            <option value="citadine">Citadine</option>
+                            <option value="compacte">Compacte</option>
+                            <option value="suv">SUV/Crossover</option>
+                            <option value="berline">Berline</option>
+                            <option value="sportive">Sportive</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Marque *</label>
+                        <input type="text" id="vehicleBrand" placeholder="Ex: Peugeot" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Modèle *</label>
+                        <input type="text" id="vehicleModel" placeholder="Ex: e-208" required>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Année</label>
+                        <input type="number" id="vehicleYear" value="2025" min="2020" max="2030">
+                    </div>
+                    <div class="form-group">
+                        <label>Prix (€)</label>
+                        <input type="number" id="vehiclePrice" placeholder="Ex: 35000">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Longueur (mm)</label>
+                        <input type="number" id="vehicleLength" placeholder="Ex: 4055">
+                    </div>
+                    <div class="form-group">
+                        <label>Largeur (mm)</label>
+                        <input type="number" id="vehicleWidth" placeholder="Ex: 1765">
+                    </div>
+                    <div class="form-group">
+                        <label>Hauteur (mm)</label>
+                        <input type="number" id="vehicleHeight" placeholder="Ex: 1430">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Empattement (mm)</label>
+                        <input type="number" id="vehicleWheelbase" placeholder="Ex: 2540">
+                    </div>
+                    <div class="form-group">
+                        <label>Volume coffre (L)</label>
+                        <input type="number" id="vehicleTrunk" placeholder="Ex: 265">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Autonomie (km)</label>
+                        <input type="text" id="vehicleAutonomy" placeholder="Ex: 400 ou 350-450">
+                    </div>
+                    <div class="form-group">
+                        <label>Poids (kg)</label>
+                        <input type="number" id="vehicleWeight" placeholder="Ex: 1530">
+                    </div>
+                </div>
+
+                <div style="text-align: center; margin-top: 15px;">
+                    <button class="btn btn-primary" onclick="addVehicle()">Ajouter manuellement</button>
+                </div>
+            </div>
+
+            <div style="text-align: center; margin-top: 20px;">
+                <button class="btn" style="background: #95a5a6; color: white;" onclick="closeAddModal()">Fermer</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Zone cachée pour import JSON -->
+    <input type="file" id="fileInput" accept=".json" style="display: none;" onchange="handleFileSelect(event)">
+
+    <script>
+        // Base de données complète de véhicules
+        const vehicleDatabase = {
+            'Renault': {
+                'Électrique': [
+                    { model: '5 E-Tech Electric', category: 'citadine', price: 27990, length: 3922, width: 1774, height: 1498, wheelbase: 2540, trunk: 277, autonomy: '300-410', weight: 1425 },
+                    { model: 'Mégane E-Tech', category: 'compacte', price: 33000, length: 4210, width: 1780, height: 1500, wheelbase: 2690, trunk: 440, autonomy: '300-470', weight: 1636 },
+                    { model: '4 E-Tech Electric', category: 'suv', price: 29990, length: 4140, width: 1800, height: 1570, wheelbase: 2620, trunk: 420, autonomy: '300-400', weight: 1520 },
+                    { model: 'Scénic E-Tech', category: 'suv', price: 36000, length: 4470, width: 1864, height: 1571, wheelbase: 2785, trunk: 545, autonomy: '430-625', weight: 1753 },
+                    { model: 'Kangoo E-Tech', category: 'suv', price: 38300, length: 4486, width: 1919, height: 1838, wheelbase: 2716, trunk: 775, autonomy: '285', weight: 1702 }
+                ],
+                'Hybride': [
+                    { model: 'Clio E-Tech 145', category: 'citadine', price: 23900, length: 4050, width: 1798, height: 1440, wheelbase: 2583, trunk: 254, autonomy: '~900', weight: 1263 },
+                    { model: 'Captur E-Tech 145', category: 'suv', price: 29800, length: 4239, width: 1797, height: 1575, wheelbase: 2674, trunk: 348, autonomy: '~850', weight: 1419 },
+                    { model: 'Captur E-Tech 160', category: 'suv', price: 32300, length: 4239, width: 1797, height: 1575, wheelbase: 2674, trunk: 536, autonomy: '~750', weight: 1203 },
+                    { model: 'Arkana E-Tech 145', category: 'suv', price: 33200, length: 4568, width: 1821, height: 1571, wheelbase: 2720, trunk: 480, autonomy: '~800', weight: 1479 }
+                ],
+                'Essence': [
+                    { model: 'Mégane 4 TCe 140', category: 'compacte', price: 28900, length: 4360, width: 1810, height: 1450, wheelbase: 2670, trunk: 473, autonomy: '~800', weight: 1214 },
+                    { model: 'Clio TCe 90', category: 'citadine', price: 18900, length: 4050, width: 1798, height: 1440, wheelbase: 2583, trunk: 391, autonomy: '~750', weight: 1165 },
+                    { model: 'Captur TCe 140', category: 'suv', price: 27500, length: 4239, width: 1797, height: 1575, wheelbase: 2674, trunk: 536, autonomy: '~700', weight: 1280 }
+                ]
+            },
+            'Peugeot': {
+                'Électrique': [
+                    { model: 'e-208', category: 'citadine', price: 34900, length: 4055, width: 1765, height: 1430, wheelbase: 2540, trunk: 265, autonomy: '362', weight: 1530 },
+                    { model: 'e-308', category: 'compacte', price: 44990, length: 4367, width: 1852, height: 1441, wheelbase: 2675, trunk: 361, autonomy: '410', weight: 1659 },
+                    { model: 'e-2008', category: 'suv', price: 37200, length: 4300, width: 1770, height: 1550, wheelbase: 2605, trunk: 434, autonomy: '345', weight: 1548 },
+                    { model: 'e-3008', category: 'suv', price: 48990, length: 4542, width: 1895, height: 1641, wheelbase: 2728, trunk: 520, autonomy: '527', weight: 2108 },
+                    { model: 'e-5008', category: 'suv', price: 53990, length: 4791, width: 1895, height: 1694, wheelbase: 2840, trunk: 259, autonomy: '502', weight: 2232 },
+                    { model: 'e-Rifter', category: 'suv', price: 40350, length: 4403, width: 1848, height: 1878, wheelbase: 2785, trunk: 775, autonomy: '280', weight: 1756 }
+                ],
+                'Hybride': [
+                    { model: '308 Hybrid 136', category: 'compacte', price: 35200, length: 4367, width: 1852, height: 1441, wheelbase: 2675, trunk: 361, autonomy: '~950', weight: 1397 },
+                    { model: '3008 Hybrid 136', category: 'suv', price: 42800, length: 4542, width: 1895, height: 1641, wheelbase: 2728, trunk: 520, autonomy: '~900', weight: 1624 }
+                ],
+                'Hybride rechargeable': [
+                    { model: '308 SW PHEV 180', category: 'compacte', price: 41850, length: 4636, width: 1852, height: 1447, wheelbase: 2732, trunk: 548, autonomy: '60', weight: 1684 },
+                    { model: '3008 PHEV 195', category: 'suv', price: 48800, length: 4542, width: 1895, height: 1641, wheelbase: 2728, trunk: 395, autonomy: '64', weight: 1815 },
+                    { model: '5008 PHEV', category: 'suv', price: 53500, length: 4791, width: 1895, height: 1694, wheelbase: 2840, trunk: 165, autonomy: '59', weight: 1940 }
+                ]
+            },
+            'Tesla': {
+                'Électrique': [
+                    { model: 'Model 3 Propulsion', category: 'berline', price: 39990, length: 4694, width: 1850, height: 1443, wheelbase: 2875, trunk: 425, autonomy: '513', weight: 1765 },
+                    { model: 'Model 3 Grande Autonomie', category: 'berline', price: 48990, length: 4694, width: 1850, height: 1443, wheelbase: 2875, trunk: 425, autonomy: '629', weight: 1828 },
+                    { model: 'Model 3 Performance', category: 'berline', price: 55990, length: 4694, width: 1850, height: 1443, wheelbase: 2875, trunk: 425, autonomy: '528', weight: 1844 },
+                    { model: 'Model Y Propulsion', category: 'suv', price: 44990, length: 4751, width: 1921, height: 1624, wheelbase: 2890, trunk: 854, autonomy: '455', weight: 2003 },
+                    { model: 'Model Y Grande Autonomie', category: 'suv', price: 51990, length: 4751, width: 1921, height: 1624, wheelbase: 2890, trunk: 854, autonomy: '533', weight: 2054 },
+                    { model: 'Model Y Performance', category: 'suv', price: 57990, length: 4751, width: 1921, height: 1624, wheelbase: 2890, trunk: 854, autonomy: '514', weight: 2054 },
+                    { model: 'Model S', category: 'berline', price: 92990, length: 4976, width: 1964, height: 1445, wheelbase: 2959, trunk: 804, autonomy: '634', weight: 2265 },
+                    { model: 'Model S Plaid', category: 'berline', price: 107990, length: 4976, width: 1964, height: 1445, wheelbase: 2959, trunk: 804, autonomy: '600', weight: 2265 },
+                    { model: 'Model X', category: 'suv', price: 99990, length: 5037, width: 2070, height: 1684, wheelbase: 2965, trunk: 709, autonomy: '543', weight: 2459 },
+                    { model: 'Model X Plaid', category: 'suv', price: 114990, length: 5037, width: 2070, height: 1684, wheelbase: 2965, trunk: 709, autonomy: '528', weight: 2459 }
+                ]
+            },
+            'Volkswagen': {
+                'Électrique': [
+                    { model: 'ID.3 Pure', category: 'compacte', price: 36990, length: 4261, width: 1809, height: 1552, wheelbase: 2765, trunk: 385, autonomy: '388', weight: 1815 },
+                    { model: 'ID.3 Pro', category: 'compacte', price: 39990, length: 4261, width: 1809, height: 1552, wheelbase: 2765, trunk: 385, autonomy: '426', weight: 1815 },
+                    { model: 'ID.3 Pro S', category: 'compacte', price: 44990, length: 4261, width: 1809, height: 1552, wheelbase: 2765, trunk: 385, autonomy: '557', weight: 1933 },
+                    { model: 'ID.4 Pure', category: 'suv', price: 41990, length: 4584, width: 1852, height: 1631, wheelbase: 2771, trunk: 543, autonomy: '346', weight: 2124 },
+                    { model: 'ID.4 Pro', category: 'suv', price: 44990, length: 4584, width: 1852, height: 1631, wheelbase: 2771, trunk: 543, autonomy: '523', weight: 2124 },
+                    { model: 'ID.5 Pro', category: 'suv', price: 48590, length: 4599, width: 1852, height: 1615, wheelbase: 2771, trunk: 549, autonomy: '518', weight: 2119 },
+                    { model: 'ID.7 Pro', category: 'berline', price: 57990, length: 4961, width: 1862, height: 1536, wheelbase: 2966, trunk: 532, autonomy: '621', weight: 2188 },
+                    { model: 'ID.Buzz Pro', category: 'suv', price: 56990, length: 4712, width: 1985, height: 1937, wheelbase: 2988, trunk: 1121, autonomy: '423', weight: 2472 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'Golf GTE', category: 'compacte', price: 44350, length: 4284, width: 1789, height: 1456, wheelbase: 2619, trunk: 272, autonomy: '64', weight: 1624 },
+                    { model: 'Passat GTE', category: 'berline', price: 57950, length: 4917, width: 1852, height: 1477, wheelbase: 2841, trunk: 450, autonomy: '100', weight: 1744 },
+                    { model: 'Tiguan eHybrid', category: 'suv', price: 47990, length: 4539, width: 1839, height: 1639, wheelbase: 2677, trunk: 476, autonomy: '50', weight: 1844 }
+                ]
+            },
+            'BMW': {
+                'Électrique': [
+                    { model: 'i4 eDrive35', category: 'berline', price: 53950, length: 4783, width: 1852, height: 1448, wheelbase: 2856, trunk: 470, autonomy: '483', weight: 2050 },
+                    { model: 'i4 eDrive40', category: 'berline', price: 59950, length: 4783, width: 1852, height: 1448, wheelbase: 2856, trunk: 470, autonomy: '590', weight: 2125 },
+                    { model: 'i4 M50', category: 'berline', price: 73950, length: 4783, width: 1852, height: 1448, wheelbase: 2856, trunk: 470, autonomy: '520', weight: 2290 },
+                    { model: 'iX1 xDrive30', category: 'suv', price: 55950, length: 4500, width: 1845, height: 1642, wheelbase: 2692, trunk: 490, autonomy: '440', weight: 2085 },
+                    { model: 'iX3', category: 'suv', price: 69950, length: 4734, width: 1891, height: 1668, wheelbase: 2864, trunk: 510, autonomy: '461', weight: 2185 },
+                    { model: 'iX xDrive50', category: 'suv', price: 103950, length: 4953, width: 1967, height: 1695, wheelbase: 3000, trunk: 500, autonomy: '631', weight: 2585 }
+                ],
+                'Hybride rechargeable': [
+                    { model: '330e', category: 'berline', price: 55200, length: 4713, width: 1827, height: 1440, wheelbase: 2851, trunk: 375, autonomy: '60', weight: 1815 },
+                    { model: '530e', category: 'berline', price: 70100, length: 5060, width: 1900, height: 1515, wheelbase: 2995, trunk: 430, autonomy: '61', weight: 2015 },
+                    { model: 'X3 xDrive30e', category: 'suv', price: 65900, length: 4708, width: 1891, height: 1676, wheelbase: 2864, trunk: 450, autonomy: '50', weight: 2080 }
+                ]
+            },
+            'Mercedes': {
+                'Électrique': [
+                    { model: 'EQA 250', category: 'suv', price: 50550, length: 4463, width: 1834, height: 1624, wheelbase: 2729, trunk: 340, autonomy: '426', weight: 2040 },
+                    { model: 'EQB 250', category: 'suv', price: 52900, length: 4684, width: 1834, height: 1667, wheelbase: 2829, trunk: 495, autonomy: '423', weight: 2175 },
+                    { model: 'EQE 350+', category: 'berline', price: 73500, length: 4946, width: 1961, height: 1512, wheelbase: 3120, trunk: 430, autonomy: '639', weight: 2355 },
+                    { model: 'EQS 350', category: 'berline', price: 114900, length: 5216, width: 1926, height: 1512, wheelbase: 3210, trunk: 610, autonomy: '784', weight: 2480 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'A 250e', category: 'compacte', price: 42650, length: 4419, width: 1796, height: 1440, wheelbase: 2729, trunk: 310, autonomy: '74', weight: 1680 },
+                    { model: 'C 300e', category: 'berline', price: 56300, length: 4751, width: 1820, height: 1438, wheelbase: 2865, trunk: 315, autonomy: '111', weight: 1950 },
+                    { model: 'GLC 300e', category: 'suv', price: 65450, length: 4716, width: 1890, height: 1640, wheelbase: 2888, trunk: 395, autonomy: '120', weight: 2115 }
+                ]
+            },
+            'Audi': {
+                'Électrique': [
+                    { model: 'Q4 e-tron 35', category: 'suv', price: 45900, length: 4588, width: 1865, height: 1632, wheelbase: 2764, trunk: 520, autonomy: '341', weight: 2050 },
+                    { model: 'Q4 e-tron 40', category: 'suv', price: 49900, length: 4588, width: 1865, height: 1632, wheelbase: 2764, trunk: 520, autonomy: '521', weight: 2135 },
+                    { model: 'Q4 Sportback e-tron', category: 'suv', price: 52400, length: 4588, width: 1865, height: 1614, wheelbase: 2764, trunk: 535, autonomy: '534', weight: 2125 },
+                    { model: 'e-tron GT', category: 'berline', price: 104890, length: 4989, width: 1964, height: 1396, wheelbase: 2900, trunk: 405, autonomy: '488', weight: 2350 },
+                    { model: 'e-tron GT RS', category: 'berline', price: 147590, length: 4989, width: 1964, height: 1396, wheelbase: 2900, trunk: 405, autonomy: '472', weight: 2420 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'A3 40 TFSI e', category: 'compacte', price: 41850, length: 4343, width: 1816, height: 1449, wheelbase: 2636, trunk: 280, autonomy: '67', weight: 1540 },
+                    { model: 'Q3 45 TFSI e', category: 'suv', price: 48600, length: 4484, width: 1849, height: 1616, wheelbase: 2680, trunk: 380, autonomy: '50', weight: 1890 },
+                    { model: 'Q5 50 TFSI e', category: 'suv', price: 67950, length: 4682, width: 1893, height: 1662, wheelbase: 2819, trunk: 450, autonomy: '62', weight: 2135 }
+                ]
+            },
+            'Hyundai': {
+                'Électrique': [
+                    { model: 'Kona Electric 39', category: 'suv', price: 35400, length: 4205, width: 1800, height: 1565, wheelbase: 2600, trunk: 332, autonomy: '289', weight: 1535 },
+                    { model: 'Kona Electric 65', category: 'suv', price: 38900, length: 4205, width: 1800, height: 1565, wheelbase: 2600, trunk: 332, autonomy: '484', weight: 1685 },
+                    { model: 'Ioniq 5 58', category: 'suv', price: 43900, length: 4635, width: 1890, height: 1605, wheelbase: 3000, trunk: 527, autonomy: '384', weight: 1919 },
+                    { model: 'Ioniq 5 77', category: 'suv', price: 49900, length: 4635, width: 1890, height: 1605, wheelbase: 3000, trunk: 527, autonomy: '507', weight: 1985 },
+                    { model: 'Ioniq 5 77 AWD', category: 'suv', price: 54400, length: 4635, width: 1890, height: 1605, wheelbase: 3000, trunk: 527, autonomy: '460', weight: 2100 },
+                    { model: 'Ioniq 6 77', category: 'berline', price: 52900, length: 4855, width: 1880, height: 1495, wheelbase: 2950, trunk: 401, autonomy: '614', weight: 1975 }
+                ],
+                'Hybride': [
+                    { model: 'Kona Hybrid', category: 'suv', price: 30300, length: 4205, width: 1800, height: 1565, wheelbase: 2600, trunk: 374, autonomy: '~900', weight: 1401 },
+                    { model: 'Tucson Hybrid', category: 'suv', price: 39950, length: 4500, width: 1865, height: 1650, wheelbase: 2680, trunk: 616, autonomy: '~950', weight: 1586 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'Tucson PHEV', category: 'suv', price: 45850, length: 4500, width: 1865, height: 1650, wheelbase: 2680, trunk: 558, autonomy: '62', weight: 1918 },
+                    { model: 'Santa Fe PHEV', category: 'suv', price: 61950, length: 4785, width: 1900, height: 1685, wheelbase: 2765, trunk: 571, autonomy: '58', weight: 2021 }
+                ]
+            },
+            'Kia': {
+                'Électrique': [
+                    { model: 'e-Niro 39', category: 'suv', price: 36990, length: 4375, width: 1805, height: 1560, wheelbase: 2700, trunk: 451, autonomy: '289', weight: 1535 },
+                    { model: 'e-Niro 64', category: 'suv', price: 40490, length: 4375, width: 1805, height: 1560, wheelbase: 2700, trunk: 451, autonomy: '460', weight: 1672 },
+                    { model: 'e-Soul 39', category: 'suv', price: 36990, length: 4195, width: 1800, height: 1605, wheelbase: 2600, trunk: 315, autonomy: '277', weight: 1502 },
+                    { model: 'e-Soul 64', category: 'suv', price: 40490, length: 4195, width: 1800, height: 1605, wheelbase: 2600, trunk: 315, autonomy: '452', weight: 1682 },
+                    { model: 'EV6 58', category: 'suv', price: 47990, length: 4680, width: 1880, height: 1550, wheelbase: 2900, trunk: 520, autonomy: '394', weight: 1985 },
+                    { model: 'EV6 77', category: 'suv', price: 51490, length: 4680, width: 1880, height: 1550, wheelbase: 2900, trunk: 520, autonomy: '528', weight: 1985 },
+                    { model: 'EV6 GT', category: 'suv', price: 69990, length: 4680, width: 1880, height: 1550, wheelbase: 2900, trunk: 480, autonomy: '424', weight: 2200 },
+                    { model: 'EV9', category: 'suv', price: 73000, length: 5015, width: 1980, height: 1780, wheelbase: 3100, trunk: 333, autonomy: '541', weight: 2636 }
+                ],
+                'Hybride': [
+                    { model: 'Niro Hybrid', category: 'suv', price: 31990, length: 4420, width: 1825, height: 1545, wheelbase: 2720, trunk: 451, autonomy: '~1000', weight: 1425 },
+                    { model: 'Sportage Hybrid', category: 'suv', price: 37490, length: 4515, width: 1865, height: 1645, wheelbase: 2680, trunk: 587, autonomy: '~950', weight: 1579 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'Niro PHEV', category: 'suv', price: 36190, length: 4420, width: 1825, height: 1545, wheelbase: 2720, trunk: 348, autonomy: '65', weight: 1543 },
+                    { model: 'Sportage PHEV', category: 'suv', price: 43590, length: 4515, width: 1865, height: 1645, wheelbase: 2680, trunk: 540, autonomy: '70', weight: 1875 }
+                ]
+            },
+            'BYD': {
+                'Électrique': [
+                    { model: 'Dolphin', category: 'citadine', price: 33990, length: 4290, width: 1770, height: 1570, wheelbase: 2700, trunk: 345, autonomy: '427', weight: 1550 },
+                    { model: 'Dolphin Surf', category: 'citadine', price: 19990, length: 4070, width: 1770, height: 1570, wheelbase: 2700, trunk: 345, autonomy: '299', weight: 1405 },
+                    { model: 'Atto 2', category: 'suv', price: 31990, length: 4310, width: 1830, height: 1675, wheelbase: 2720, trunk: 370, autonomy: '312', weight: 1650 },
+                    { model: 'Atto 3', category: 'suv', price: 38990, length: 4455, width: 1875, height: 1615, wheelbase: 2720, trunk: 440, autonomy: '420', weight: 1750 },
+                    { model: 'Seal', category: 'berline', price: 46990, length: 4800, width: 1875, height: 1460, wheelbase: 2920, trunk: 400, autonomy: '570', weight: 2150 },
+                    { model: 'Han', category: 'berline', price: 79990, length: 4995, width: 1910, height: 1495, wheelbase: 2920, trunk: 410, autonomy: '521', weight: 2350 },
+                    { model: 'Tang', category: 'suv', price: 72990, length: 4870, width: 1950, height: 1725, wheelbase: 2820, trunk: 940, autonomy: '530', weight: 2400 }
+                ]
+            },
+            'MG': {
+                'Électrique': [
+                    { model: 'MG4 Standard', category: 'compacte', price: 29990, length: 4287, width: 1836, height: 1504, wheelbase: 2705, trunk: 363, autonomy: '350', weight: 1685 },
+                    { model: 'MG4 Long Range', category: 'compacte', price: 32990, length: 4287, width: 1836, height: 1504, wheelbase: 2705, trunk: 363, autonomy: '435', weight: 1720 },
+                    { model: 'MG4 XPOWER', category: 'compacte', price: 39990, length: 4287, width: 1836, height: 1504, wheelbase: 2705, trunk: 363, autonomy: '385', weight: 1800 },
+                    { model: 'MG5 Standard', category: 'compacte', price: 32490, length: 4480, width: 1850, height: 1620, wheelbase: 2730, trunk: 453, autonomy: '340', weight: 1635 },
+                    { model: 'MG5 Long Range', category: 'compacte', price: 36490, length: 4480, width: 1850, height: 1620, wheelbase: 2730, trunk: 453, autonomy: '480', weight: 1705 },
+                    { model: 'MG ZS EV', category: 'suv', price: 31990, length: 4323, width: 1809, height: 1649, wheelbase: 2585, trunk: 448, autonomy: '320', weight: 1620 }
+                ],
+                'Hybride': [
+                    { model: 'MG3 Hybrid+', category: 'citadine', price: 19990, length: 4113, width: 1797, height: 1502, wheelbase: 2570, trunk: 293, autonomy: '~1000', weight: 1275 },
+                    { model: 'MG HS Hybrid', category: 'suv', price: 32990, length: 4610, width: 1876, height: 1685, wheelbase: 2720, trunk: 463, autonomy: '~900', weight: 1750 }
+                ]
+            },
+            'Nissan': {
+                'Électrique': [
+                    { model: 'Leaf 40kWh', category: 'compacte', price: 32300, length: 4490, width: 1788, height: 1540, wheelbase: 2700, trunk: 435, autonomy: '270', weight: 1580 },
+                    { model: 'Leaf e+ 62kWh', category: 'compacte', price: 38800, length: 4490, width: 1788, height: 1540, wheelbase: 2700, trunk: 435, autonomy: '385', weight: 1640 },
+                    { model: 'Ariya 63kWh', category: 'suv', price: 45000, length: 4595, width: 1850, height: 1660, wheelbase: 2775, trunk: 468, autonomy: '403', weight: 1950 },
+                    { model: 'Ariya 87kWh', category: 'suv', price: 52000, length: 4595, width: 1850, height: 1660, wheelbase: 2775, trunk: 468, autonomy: '531', weight: 2100 }
+                ],
+                'Hybride': [
+                    { model: 'Juke Hybrid', category: 'suv', price: 29900, length: 4210, width: 1800, height: 1595, wheelbase: 2636, trunk: 354, autonomy: '~900', weight: 1395 },
+                    { model: 'Qashqai e-Power', category: 'suv', price: 35540, length: 4425, width: 1835, height: 1625, wheelbase: 2665, trunk: 504, autonomy: '~950', weight: 1543 }
+                ]
+            },
+            'Opel': {
+                'Électrique': [
+                    { model: 'Corsa-e', category: 'citadine', price: 33950, length: 4060, width: 1765, height: 1433, wheelbase: 2538, trunk: 267, autonomy: '357', weight: 1530 },
+                    { model: 'Astra Electric', category: 'compacte', price: 43050, length: 4374, width: 1860, height: 1441, wheelbase: 2675, trunk: 352, autonomy: '418', weight: 1765 },
+                    { model: 'Mokka-e', category: 'suv', price: 36650, length: 4151, width: 1791, height: 1534, wheelbase: 2557, trunk: 310, autonomy: '338', weight: 1598 },
+                    { model: 'Zafira-e Life', category: 'suv', price: 53370, length: 4956, width: 1920, height: 1895, wheelbase: 3275, trunk: 1050, autonomy: '330', weight: 2490 }
+                ],
+                'Hybride': [
+                    { model: 'Astra Hybrid', category: 'compacte', price: 35550, length: 4374, width: 1860, height: 1441, wheelbase: 2675, trunk: 352, autonomy: '~950', weight: 1521 },
+                    { model: 'Grandland Hybrid', category: 'suv', price: 42100, length: 4477, width: 1856, height: 1609, wheelbase: 2675, trunk: 390, autonomy: '~900', weight: 1660 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'Astra PHEV', category: 'compacte', price: 40550, length: 4374, width: 1860, height: 1441, wheelbase: 2675, trunk: 352, autonomy: '60', weight: 1660 },
+                    { model: 'Grandland PHEV', category: 'suv', price: 46100, length: 4477, width: 1856, height: 1609, wheelbase: 2675, trunk: 390, autonomy: '65', weight: 1875 }
+                ]
+            },
+            'Citroën': {
+                'Électrique': [
+                    { model: 'ë-C3', category: 'citadine', price: 23300, length: 4015, width: 1755, height: 1577, wheelbase: 2540, trunk: 310, autonomy: '320', weight: 1416 },
+                    { model: 'ë-C4', category: 'compacte', price: 34450, length: 4360, width: 1800, height: 1525, wheelbase: 2670, trunk: 380, autonomy: '357', weight: 1561 },
+                    { model: 'ë-C4 X', category: 'berline', price: 36900, length: 4600, width: 1800, height: 1525, wheelbase: 2670, trunk: 510, autonomy: '360', weight: 1625 },
+                    { model: 'ë-Berlingo', category: 'suv', price: 35590, length: 4403, width: 1848, height: 1844, wheelbase: 2785, trunk: 775, autonomy: '280', weight: 1734 },
+                    { model: 'ë-SpaceTourer', category: 'suv', price: 48550, length: 4956, width: 1920, height: 1895, wheelbase: 3275, trunk: 603, autonomy: '330', weight: 2361 }
+                ],
+                'Hybride': [
+                    { model: 'C3 Hybrid', category: 'citadine', price: 20990, length: 4015, width: 1755, height: 1577, wheelbase: 2540, trunk: 310, autonomy: '~950', weight: 1280 },
+                    { model: 'C5 Aircross Hybrid', category: 'suv', price: 39650, length: 4500, width: 1859, height: 1689, wheelbase: 2730, trunk: 460, autonomy: '~900', weight: 1625 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'C5 X PHEV', category: 'berline', price: 44550, length: 4805, width: 1865, height: 1485, wheelbase: 2785, trunk: 485, autonomy: '60', weight: 1800 }
+                ]
+            },
+            'Fiat': {
+                'Électrique': [
+                    { model: '500e', category: 'citadine', price: 30400, length: 3632, width: 1683, height: 1527, wheelbase: 2322, trunk: 185, autonomy: '320', weight: 1365 },
+                    { model: '500e 3+1', category: 'citadine', price: 31400, length: 3632, width: 1683, height: 1527, wheelbase: 2322, trunk: 185, autonomy: '320', weight: 1390 },
+                    { model: '600e', category: 'suv', price: 35900, length: 4171, width: 1781, height: 1523, wheelbase: 2562, trunk: 360, autonomy: '409', weight: 1520 },
+                    { model: 'E-Doblò', category: 'suv', price: 37900, length: 4403, width: 1848, height: 1845, wheelbase: 2785, trunk: 775, autonomy: '280', weight: 1785 }
+                ],
+                'Hybride': [
+                    { model: 'Panda Hybrid', category: 'citadine', price: 16990, length: 3686, width: 1672, height: 1618, wheelbase: 2300, trunk: 225, autonomy: '~800', weight: 1065 },
+                    { model: '500 Hybrid', category: 'citadine', price: 18990, length: 3571, width: 1627, height: 1488, wheelbase: 2300, trunk: 185, autonomy: '~850', weight: 1040 }
+                ]
+            },
+            'Ford': {
+                'Électrique': [
+                    { model: 'Mustang Mach-E RWD', category: 'suv', price: 56500, length: 4713, width: 1881, height: 1624, wheelbase: 2984, trunk: 402, autonomy: '440', weight: 2063 },
+                    { model: 'Mustang Mach-E AWD', category: 'suv', price: 63000, length: 4713, width: 1881, height: 1624, wheelbase: 2984, trunk: 402, autonomy: '550', weight: 2218 },
+                    { model: 'Mustang Mach-E GT', category: 'suv', price: 78500, length: 4743, width: 1881, height: 1613, wheelbase: 2984, trunk: 402, autonomy: '490', weight: 2273 }
+                ],
+                'Hybride': [
+                    { model: 'Puma Hybrid', category: 'suv', price: 28500, length: 4186, width: 1805, height: 1536, wheelbase: 2588, trunk: 456, autonomy: '~900', weight: 1280 },
+                    { model: 'Focus Hybrid', category: 'compacte', price: 31500, length: 4378, width: 1825, height: 1452, wheelbase: 2700, trunk: 341, autonomy: '~950', weight: 1385 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'Kuga PHEV', category: 'suv', price: 42400, length: 4614, width: 1883, height: 1662, wheelbase: 2710, trunk: 411, autonomy: '64', weight: 1844 },
+                    { model: 'Explorer PHEV', category: 'suv', price: 81500, length: 5049, width: 2004, height: 1778, wheelbase: 3025, trunk: 330, autonomy: '42', weight: 2466 }
+                ]
+            },
+            'Skoda': {
+                'Électrique': [
+                    { model: 'Enyaq iV 60', category: 'suv', price: 42960, length: 4649, width: 1879, height: 1616, wheelbase: 2765, trunk: 585, autonomy: '412', weight: 2008 },
+                    { model: 'Enyaq iV 80', category: 'suv', price: 47970, length: 4649, width: 1879, height: 1616, wheelbase: 2765, trunk: 585, autonomy: '534', weight: 2087 },
+                    { model: 'Enyaq Coupé iV', category: 'suv', price: 49840, length: 4653, width: 1879, height: 1601, wheelbase: 2765, trunk: 570, autonomy: '545', weight: 2117 }
+                ],
+                'Hybride rechargeable': [
+                    { model: 'Octavia iV', category: 'compacte', price: 40140, length: 4689, width: 1829, height: 1470, wheelbase: 2680, trunk: 450, autonomy: '60', weight: 1585 },
+                    { model: 'Superb iV', category: 'berline', price: 46100, length: 4869, width: 1864, height: 1469, wheelbase: 2841, trunk: 485, autonomy: '62', weight: 1730 },
+                    { model: 'Kodiaq iV', category: 'suv', price: 48700, length: 4697, width: 1882, height: 1685, wheelbase: 2791, trunk: 340, autonomy: '50', weight: 1995 }
+                ]
+            }
+        };
+
+        // Base de données en mémoire
+        let vehicleData = [
+            // Références
+            { category: 'reference', type: 'Essence', brand: 'Renault', model: 'Mégane 4 TCe 140', year: 2024, price: 28900, length: 4360, width: 1810, height: 1450, wheelbase: 2670, trunk: 473, autonomy: '~800', weight: 1214 },
+            { category: 'reference', type: 'Hybride', brand: 'Renault', model: 'Captur E-Tech 160', year: 2025, price: 32300, length: 4239, width: 1797, height: 1575, wheelbase: 2674, trunk: 536, autonomy: '~750', weight: 1203 },
+            
+            // COMPACTES ÉLECTRIQUES
+            { category: 'compacte', type: 'Électrique', brand: 'Renault', model: 'Mégane E-Tech', year: 2025, price: 33000, length: 4210, width: 1780, height: 1500, wheelbase: 2690, trunk: 440, autonomy: '300-470', weight: 1636 },
+            { category: 'compacte', type: 'Électrique', brand: 'Peugeot', model: 'e-308', year: 2025, price: 44990, length: 4367, width: 1852, height: 1441, wheelbase: 2675, trunk: 361, autonomy: '410', weight: 1659 },
+            { category: 'compacte', type: 'Électrique', brand: 'Citroën', model: 'ë-C4', year: 2025, price: 34450, length: 4360, width: 1800, height: 1525, wheelbase: 2670, trunk: 380, autonomy: '357', weight: 1561 },
+            { category: 'compacte', type: 'Électrique', brand: 'BYD', model: 'Dolphin', year: 2025, price: 33990, length: 4290, width: 1770, height: 1570, wheelbase: 2700, trunk: 345, autonomy: '427', weight: 1550 },
+            
+            // SUV ÉLECTRIQUES
+            { category: 'suv', type: 'Électrique', brand: 'Kia', model: 'e-Niro 64', year: 2025, price: 40490, length: 4375, width: 1805, height: 1560, wheelbase: 2700, trunk: 451, autonomy: '460', weight: 1672 },
+            { category: 'suv', type: 'Électrique', brand: 'Renault', model: '4 E-Tech Electric', year: 2025, price: 29990, length: 4140, width: 1800, height: 1570, wheelbase: 2620, trunk: 420, autonomy: '300-400', weight: 1520 },
+            { category: 'suv', type: 'Électrique', brand: 'Renault', model: 'Scénic E-Tech', year: 2025, price: 36000, length: 4470, width: 1864, height: 1571, wheelbase: 2785, trunk: 545, autonomy: '430-625', weight: 1753 },
+            { category: 'suv', type: 'Électrique', brand: 'Hyundai', model: 'Ioniq 5 77', year: 2025, price: 49900, length: 4635, width: 1890, height: 1605, wheelbase: 3000, trunk: 527, autonomy: '507', weight: 1985 },
+            { category: 'suv', type: 'Électrique', brand: 'Peugeot', model: 'e-2008', year: 2025, price: 37200, length: 4300, width: 1770, height: 1550, wheelbase: 2605, trunk: 434, autonomy: '345', weight: 1548 },
+            { category: 'suv', type: 'Électrique', brand: 'Peugeot', model: 'e-3008', year: 2025, price: 48990, length: 4542, width: 1895, height: 1641, wheelbase: 2728, trunk: 520, autonomy: '527', weight: 2108 },
+            { category: 'suv', type: 'Électrique', brand: 'Kia', model: 'EV6 77', year: 2025, price: 51490, length: 4680, width: 1880, height: 1550, wheelbase: 2900, trunk: 520, autonomy: '528', weight: 1985 },
+            { category: 'suv', type: 'Électrique', brand: 'BYD', model: 'Atto 3', year: 2025, price: 38990, length: 4455, width: 1875, height: 1615, wheelbase: 2720, trunk: 440, autonomy: '420', weight: 1750 },
+            { category: 'suv', type: 'Électrique', brand: 'Tesla', model: 'Model Y Propulsion', year: 2025, price: 44990, length: 4751, width: 1921, height: 1624, wheelbase: 2890, trunk: 854, autonomy: '455', weight: 2003 },
+            { category: 'suv', type: 'Électrique', brand: 'Tesla', model: 'Model Y Grande Autonomie', year: 2025, price: 51990, length: 4751, width: 1921, height: 1624, wheelbase: 2890, trunk: 854, autonomy: '533', weight: 2054 },
+            { category: 'suv', type: 'Électrique', brand: 'Ford', model: 'Mustang Mach-E RWD', year: 2025, price: 56500, length: 4713, width: 1881, height: 1624, wheelbase: 2984, trunk: 402, autonomy: '440', weight: 2063 },
+            { category: 'suv', type: 'Électrique', brand: 'Ford', model: 'Mustang Mach-E AWD', year: 2025, price: 63000, length: 4713, width: 1881, height: 1624, wheelbase: 2984, trunk: 402, autonomy: '550', weight: 2218 },
+            { category: 'suv', type: 'Électrique', brand: 'Hyundai', model: 'Kona Electric 65', year: 2025, price: 38900, length: 4205, width: 1800, height: 1565, wheelbase: 2600, trunk: 332, autonomy: '484', weight: 1685 },
+            { category: 'suv', type: 'Électrique', brand: 'Citroën', model: 'ë-C4 X', year: 2025, price: 36900, length: 4600, width: 1800, height: 1525, wheelbase: 2670, trunk: 510, autonomy: '360', weight: 1625 },
+            { category: 'suv', type: 'Électrique', brand: 'Peugeot', model: 'e-5008', year: 2025, price: 53990, length: 4791, width: 1895, height: 1694, wheelbase: 2840, trunk: 259, autonomy: '502', weight: 2232 },
+            { category: 'suv', type: 'Électrique', brand: 'Kia', model: 'EV9', year: 2025, price: 73000, length: 5015, width: 1980, height: 1780, wheelbase: 3100, trunk: 333, autonomy: '541', weight: 2636 },
+            { category: 'suv', type: 'Électrique', brand: 'BYD', model: 'Tang', year: 2025, price: 72990, length: 4870, width: 1950, height: 1725, wheelbase: 2820, trunk: 940, autonomy: '530', weight: 2400 },
+            { category: 'suv', type: 'Électrique', brand: 'XPeng', model: 'G6', year: 2025, price: 42990, length: 4753, width: 1920, height: 1650, wheelbase: 2890, trunk: 571, autonomy: '570', weight: 1980 },
+            { category: 'suv', type: 'Électrique', brand: 'XPeng', model: 'G9', year: 2025, price: 59990, length: 4891, width: 1937, height: 1680, wheelbase: 2998, trunk: 660, autonomy: '570', weight: 2340 },
+            
+            // BERLINES ÉLECTRIQUES
+            { category: 'berline', type: 'Électrique', brand: 'Tesla', model: 'Model 3 Propulsion', year: 2025, price: 39990, length: 4694, width: 1850, height: 1443, wheelbase: 2875, trunk: 425, autonomy: '513', weight: 1765 },
+            { category: 'berline', type: 'Électrique', brand: 'Tesla', model: 'Model 3 Grande Autonomie', year: 2025, price: 48990, length: 4694, width: 1850, height: 1443, wheelbase: 2875, trunk: 425, autonomy: '629', weight: 1828 },
+            { category: 'berline', type: 'Électrique', brand: 'Hyundai', model: 'Ioniq 6 77', year: 2025, price: 52900, length: 4855, width: 1880, height: 1495, wheelbase: 2950, trunk: 401, autonomy: '614', weight: 1975 },
+            { category: 'berline', type: 'Électrique', brand: 'BYD', model: 'Seal', year: 2025, price: 46990, length: 4800, width: 1875, height: 1460, wheelbase: 2920, trunk: 400, autonomy: '570', weight: 2150 },
+            { category: 'berline', type: 'Électrique', brand: 'BYD', model: 'Han', year: 2025, price: 79990, length: 4995, width: 1910, height: 1495, wheelbase: 2920, trunk: 410, autonomy: '521', weight: 2350 },
+            { category: 'berline', type: 'Électrique', brand: 'XPeng', model: 'P7', year: 2025, price: 49990, length: 4880, width: 1896, height: 1450, wheelbase: 2998, trunk: 440, autonomy: '625', weight: 1985 }
+        ];
+
+        // Dimensions du garage
+        let garageDimensions = {
+            length: null,
+            width: null,
+            height: null
+        };
+
+        // Référence pour la coloration
+        const referenceVehicle = vehicleData[0];
+
+        // Véhicules supprimés (pour restauration)
+        let deletedVehicles = [];
+
+        // Véhicules trouvés lors de la recherche
+        let foundVehicles = [];
+
+        // Fonction de mise à jour des dimensions du garage
+        function updateGarageDimensions() {
+            const length = document.getElementById('garageLength').value;
+            const width = document.getElementById('garageWidth').value;
+            const height = document.getElementById('garageHeight').value;
+            
+            garageDimensions.length = length ? parseInt(length) : null;
+            garageDimensions.width = width ? parseInt(width) : null;
+            garageDimensions.height = height ? parseInt(height) : null;
+            
+            // Sauvegarder dans localStorage
+            localStorage.setItem('garageDimensions', JSON.stringify(garageDimensions));
+            
+            // Rafraîchir le tableau
+            initTable();
+        }
+
+        // Charger les dimensions du garage au démarrage
+        function loadGarageDimensions() {
+            const saved = localStorage.getItem('garageDimensions');
+            if (saved) {
+                garageDimensions = JSON.parse(saved);
+                document.getElementById('garageLength').value = garageDimensions.length || '';
+                document.getElementById('garageWidth').value = garageDimensions.width || '';
+                document.getElementById('garageHeight').value = garageDimensions.height || '';
+            }
+        }
+
+        // Vérifier si un véhicule rentre dans le garage
+        function checkGarageFit(vehicle) {
+            if (!garageDimensions.length || !garageDimensions.width || !garageDimensions.height) {
+                return null;
+            }
+            
+            const fitsLength = vehicle.length <= garageDimensions.length;
+            const fitsWidth = vehicle.width <= garageDimensions.width;
+            const fitsHeight = vehicle.height <= garageDimensions.height;
+            
+            return fitsLength && fitsWidth && fitsHeight;
+        }
+
+        // Fonction de recherche de véhicules
+        function searchVehicles() {
+            const type = document.getElementById('searchType').value;
+            const brand = document.getElementById('searchBrand').value;
+            
+            if (!type || !brand) {
+                alert('⚠️ Veuillez sélectionner le type de véhicule ET la marque');
+                return;
+            }
+            
+            // Rechercher dans la base de données
+            foundVehicles = [];
+            if (vehicleDatabase[brand] && vehicleDatabase[brand][type]) {
+                foundVehicles = vehicleDatabase[brand][type].map((v, index) => ({
+                    ...v,
+                    type: type,
+                    brand: brand,
+                    year: 2025,
+                    id: `search_${Date.now()}_${index}`
+                }));
+            }
+            
+            // Afficher les résultats
+            const resultsDiv = document.getElementById('searchResults');
+            const vehiclesList = document.getElementById('vehiclesList');
+            const resultsHeader = document.getElementById('searchResultsHeader');
+            
+            if (foundVehicles.length > 0) {
+                resultsHeader.innerHTML = `✅ ${foundVehicles.length} véhicule(s) ${type}(s) ${brand} trouvé(s)`;
+                
+                let html = '';
+                foundVehicles.forEach(vehicle => {
+                    const categoryLabel = getCategoryLabel(vehicle.category);
+                    const fits = checkGarageFit(vehicle);
+                    const fitsBadge = fits !== null ? 
+                        (fits ? '<span class="fits-yes">✓ Garage OK</span>' : '<span class="fits-no">✗ Trop grand</span>') : '';
+                    
+                    html += `
+                        <div class="vehicle-item">
+                            <input type="checkbox" id="${vehicle.id}" value="${vehicle.id}">
+                            <label for="${vehicle.id}">
+                                <div class="vehicle-info">
+                                    <div class="vehicle-main">
+                                        <div class="vehicle-name">${vehicle.model} ${fitsBadge}</div>
+                                        <div class="vehicle-specs">
+                                            ${categoryLabel} • ${vehicle.length}×${vehicle.width}×${vehicle.height} mm
+                                            • ${vehicle.trunk}L • ${vehicle.autonomy} km • ${vehicle.weight} kg
+                                        </div>
+                                    </div>
+                                    <div class="vehicle-price">
+                                        ${vehicle.price ? vehicle.price.toLocaleString() + ' €' : 'Prix NC'}
+                                    </div>
+                                </div>
+                            </label>
+                        </div>
+                    `;
+                });
+                
+                vehiclesList.innerHTML = html;
+                resultsDiv.style.display = 'block';
+            } else {
+                resultsHeader.innerHTML = `❌ Aucun véhicule ${type} ${brand} trouvé`;
+                vehiclesList.innerHTML = `
+                    <p style="text-align: center; color: #7f8c8d;">
+                        Essayez une autre combinaison ou utilisez le formulaire manuel ci-dessous.
+                    </p>
+                `;
+                resultsDiv.style.display = 'block';
+            }
+        }
+
+        // Sélectionner tous les véhicules
+        function selectAllVehicles() {
+            foundVehicles.forEach(vehicle => {
+                const checkbox = document.getElementById(vehicle.id);
+                if (checkbox) checkbox.checked = true;
+            });
+        }
+
+        // Ajouter les véhicules sélectionnés
+        function addSelectedVehicles() {
+            let addedCount = 0;
+            
+            foundVehicles.forEach(vehicle => {
+                const checkbox = document.getElementById(vehicle.id);
+                if (checkbox && checkbox.checked) {
+                    vehicleData.push({
+                        ...vehicle,
+                        id: Date.now() + Math.random()
+                    });
+                    addedCount++;
+                }
+            });
+            
+            if (addedCount > 0) {
+                initTable();
+                alert(`✅ ${addedCount} véhicule(s) ajouté(s) au tableau !`);
+                closeAddModal();
+            } else {
+                alert('⚠️ Veuillez sélectionner au moins un véhicule');
+            }
+        }
+
+        // Obtenir le label de catégorie
+        function getCategoryLabel(category) {
+            const labels = {
+                'reference': 'Référence',
+                'citadine': 'Citadine',
+                'compacte': 'Compacte',
+                'suv': 'SUV',
+                'berline': 'Berline',
+                'sportive': 'Sportive'
+            };
+            return labels[category] || category;
+        }
+
+        // Initialiser le tableau
+        function initTable() {
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+
+            const categories = {
+                'reference': '⛽🔋 RÉFÉRENCES',
+                'citadine': '🏙️ CITADINES',
+                'compacte': '🚗 COMPACTES',
+                'suv': '🚙 SUV & CROSSOVERS',
+                'berline': '🚘 BERLINES',
+                'sportive': '🏎️ SPORTIVES'
+            };
+
+            Object.keys(categories).forEach(cat => {
+                const vehicles = vehicleData.filter(v => v.category === cat && !v.deleted);
+                if (vehicles.length > 0) {
+                    const catRow = document.createElement('tr');
+                    catRow.className = 'category-row';
+                    catRow.innerHTML = `<td colspan="14">${categories[cat]}</td>`;
+                    tbody.appendChild(catRow);
+
+                    vehicles.forEach(vehicle => {
+                        const row = createVehicleRow(vehicle);
+                        tbody.appendChild(row);
+                    });
+                }
+            });
+        }
+
+        // Créer une ligne de véhicule
+        function createVehicleRow(vehicle) {
+            const row = document.createElement('tr');
+            const brandClass = `brand-${vehicle.brand.toLowerCase().replace(/[^a-z]/g, '')}`;
+            row.className = brandClass;
+            row.setAttribute('data-category', vehicle.category);
+            row.setAttribute('data-brand', vehicle.brand.toLowerCase());
+            row.setAttribute('data-id', vehicle.id || Date.now());
+
+            const fits = checkGarageFit(vehicle);
+            const garageBadge = fits !== null ? 
+                (fits ? '<span class="fits-yes">✓</span>' : '<span class="fits-no">✗</span>') : 
+                '<span style="color: #999;">-</span>';
+
+            row.innerHTML = `
+                <td><button class="delete-btn" onclick="deleteRow(this)">❌</button></td>
+                <td>${vehicle.type}</td>
+                <td><strong>${vehicle.brand}</strong></td>
+                <td class="editable">${vehicle.model}</td>
+                <td class="editable">${vehicle.year}</td>
+                <td class="editable">${vehicle.price.toLocaleString()}</td>
+                <td class="dimension editable ${getDimensionClass(vehicle.length, 'length', fits)}">${vehicle.length}</td>
+                <td class="dimension editable ${getDimensionClass(vehicle.width, 'width', fits)}">${vehicle.width}</td>
+                <td class="dimension editable ${getDimensionClass(vehicle.height, 'height', fits)}">${vehicle.height}</td>
+                <td class="dimension editable ${getDimensionClass(vehicle.wheelbase, 'wheelbase', fits)}">${vehicle.wheelbase}</td>
+                <td class="dimension editable ${getDimensionClass(vehicle.trunk, 'trunk', fits)}">${vehicle.trunk}</td>
+                <td class="editable">${vehicle.autonomy}</td>
+                <td class="dimension editable ${getDimensionClass(vehicle.weight, 'weight', fits)}">${vehicle.weight}</td>
+                <td>${garageBadge}</td>
+            `;
+
+            row.querySelectorAll('.editable').forEach(cell => {
+                cell.addEventListener('click', function() {
+                    editCell(this);
+                });
+            });
+
+            return row;
+        }
+
+        // Déterminer la classe de couleur
+        function getDimensionClass(value, type, fits) {
+            if (!value || value === '-') return '';
+            const numValue = parseFloat(value);
+            
+            // Si le véhicule ne rentre pas dans le garage, colorer en orange
+            if (fits === false) {
+                if (type === 'length' && garageDimensions.length && numValue > garageDimensions.length) {
+                    return 'garage-warning';
+                }
+                if (type === 'width' && garageDimensions.width && numValue > garageDimensions.width) {
+                    return 'garage-warning';
+                }
+                if (type === 'height' && garageDimensions.height && numValue > garageDimensions.height) {
+                    return 'garage-warning';
+                }
+            }
+            
+            // Comparaison avec le véhicule de référence
+            const refValues = {
+                'length': referenceVehicle.length,
+                'width': referenceVehicle.width,
+                'height': referenceVehicle.height,
+                'wheelbase': referenceVehicle.wheelbase,
+                'trunk': referenceVehicle.trunk,
+                'weight': referenceVehicle.weight
+            };
+            
+            const refValue = refValues[type];
+            if (!refValue) return '';
+            
+            if (type === 'trunk') {
+                return numValue > refValue ? 'dimension-green' : 'dimension-red';
+            } else {
+                return numValue < refValue ? 'dimension-green' : 'dimension-red';
+            }
+        }
+
+        // Éditer une cellule
+        function editCell(cell) {
+            if (cell.classList.contains('editing')) return;
+
+            const originalValue = cell.textContent.trim();
+            cell.classList.add('editing');
+
+            const input = document.createElement('input');
+            input.className = 'edit-input';
+            input.value = originalValue;
+            input.type = 'text';
+
+            cell.innerHTML = '';
+            cell.appendChild(input);
+            input.select();
+            input.focus();
+
+            function saveEdit() {
+                const newValue = input.value.trim();
+                cell.classList.remove('editing');
+                cell.textContent = newValue || originalValue;
+                
+                updateVehicleData(cell, newValue);
+                
+                // Rafraîchir tout le tableau pour mettre à jour les couleurs
+                initTable();
+            }
+
+            function cancelEdit() {
+                cell.classList.remove('editing');
+                cell.textContent = originalValue;
+            }
+
+            input.addEventListener('keydown', function(e) {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    saveEdit();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    cancelEdit();
+                }
+            });
+
+            input.addEventListener('blur', saveEdit);
+        }
+
+        // Mettre à jour les données en mémoire
+        function updateVehicleData(cell, newValue) {
+            const row = cell.parentNode;
+            const vehicleId = row.getAttribute('data-id');
+            const cellIndex = Array.from(row.children).indexOf(cell);
+            
+            const fieldMap = {
+                3: 'model',
+                4: 'year',
+                5: 'price',
+                6: 'length',
+                7: 'width',
+                8: 'height',
+                9: 'wheelbase',
+                10: 'trunk',
+                11: 'autonomy',
+                12: 'weight'
+            };
+            
+            const field = fieldMap[cellIndex];
+            if (field) {
+                const vehicle = vehicleData.find(v => v.id == vehicleId);
+                if (vehicle) {
+                    if (['year', 'price', 'length', 'width', 'height', 'wheelbase', 'trunk', 'weight'].includes(field)) {
+                        vehicle[field] = parseInt(newValue.replace(/\D/g, '')) || 0;
+                    } else {
+                        vehicle[field] = newValue;
+                    }
+                }
+            }
+        }
+
+        // Supprimer une ligne
+        function deleteRow(button) {
+            const row = button.closest('tr');
+            const vehicleId = row.getAttribute('data-id');
+            const vehicle = vehicleData.find(v => v.id == vehicleId);
+            
+            if (vehicle) {
+                vehicle.deleted = true;
+                deletedVehicles.push(vehicle);
+            }
+            
+            row.classList.add('deleted');
+        }
+
+        // Restaurer tout
+        function restoreAll() {
+            deletedVehicles.forEach(vehicle => {
+                vehicle.deleted = false;
+            });
+            deletedVehicles = [];
+            initTable();
+        }
+
+        // Ajouter un véhicule manuellement
+        function addVehicle() {
+            const vehicle = {
+                id: Date.now(),
+                type: document.getElementById('vehicleType').value,
+                category: document.getElementById('vehicleCategory').value,
+                brand: document.getElementById('vehicleBrand').value,
+                model: document.getElementById('vehicleModel').value,
+                year: parseInt(document.getElementById('vehicleYear').value) || 2025,
+                price: parseInt(document.getElementById('vehiclePrice').value) || 0,
+                length: parseInt(document.getElementById('vehicleLength').value) || 0,
+                width: parseInt(document.getElementById('vehicleWidth').value) || 0,
+                height: parseInt(document.getElementById('vehicleHeight').value) || 0,
+                wheelbase: parseInt(document.getElementById('vehicleWheelbase').value) || 0,
+                trunk: parseInt(document.getElementById('vehicleTrunk').value) || 0,
+                autonomy: document.getElementById('vehicleAutonomy').value || '-',
+                weight: parseInt(document.getElementById('vehicleWeight').value) || 0
+            };
+
+            if (!vehicle.brand || !vehicle.model) {
+                alert('⚠️ Veuillez remplir au moins la marque et le modèle');
+                return;
+            }
+
+            vehicleData.push(vehicle);
+            initTable();
+            closeAddModal();
+        }
+
+        // Export des données en JSON
+        function exportData() {
+            const dataToExport = {
+                vehicles: vehicleData,
+                deletedVehicles: deletedVehicles,
+                garageDimensions: garageDimensions,
+                exportDate: new Date().toISOString()
+            };
+            
+            const jsonStr = JSON.stringify(dataToExport, null, 2);
+            const blob = new Blob([jsonStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `vehicules_${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            alert('✅ Données exportées avec succès !');
+        }
+
+        // Import des données JSON
+        function importData() {
+            document.getElementById('fileInput').click();
+        }
+
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    if (data.vehicles) {
+                        vehicleData = data.vehicles.map(v => ({...v, id: v.id || Date.now() + Math.random()}));
+                        deletedVehicles = data.deletedVehicles || [];
+                        
+                        // Importer les dimensions du garage si présentes
+                        if (data.garageDimensions) {
+                            garageDimensions = data.garageDimensions;
+                            document.getElementById('garageLength').value = garageDimensions.length || '';
+                            document.getElementById('garageWidth').value = garageDimensions.width || '';
+                            document.getElementById('garageHeight').value = garageDimensions.height || '';
+                            localStorage.setItem('garageDimensions', JSON.stringify(garageDimensions));
+                        }
+                        
+                        initTable();
+                        alert('✅ Données importées avec succès !');
+                    } else {
+                        alert('❌ Fichier JSON invalide');
+                    }
+                } catch (err) {
+                    alert('❌ Erreur lors de l\'import : ' + err.message);
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        // Sauvegarder en HTML
+        function saveTable() {
+            const htmlContent = document.documentElement.outerHTML;
+            const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `comparateur_${new Date().toISOString().split('T')[0]}.html`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            alert('💾 Tableau sauvegardé en HTML !');
+        }
+
+        // Modal
+        function openAddModal() {
+            document.getElementById('addModal').style.display = 'block';
+            document.getElementById('searchResults').style.display = 'none';
+        }
+
+        function closeAddModal() {
+            document.getElementById('addModal').style.display = 'none';
+            clearForm();
+        }
+
+        function clearForm() {
+            document.getElementById('searchType').value = '';
+            document.getElementById('searchBrand').value = '';
+            document.getElementById('vehicleType').value = 'Électrique';
+            document.getElementById('vehicleCategory').value = 'citadine';
+            document.getElementById('vehicleBrand').value = '';
+            document.getElementById('vehicleModel').value = '';
+            document.getElementById('vehicleYear').value = '2025';
+            document.getElementById('vehiclePrice').value = '';
+            document.getElementById('vehicleLength').value = '';
+            document.getElementById('vehicleWidth').value = '';
+            document.getElementById('vehicleHeight').value = '';
+            document.getElementById('vehicleWheelbase').value = '';
+            document.getElementById('vehicleTrunk').value = '';
+            document.getElementById('vehicleAutonomy').value = '';
+            document.getElementById('vehicleWeight').value = '';
+            document.getElementById('searchResults').style.display = 'none';
+            foundVehicles = [];
+        }
+
+        // Fermer le modal en cliquant dehors
+        window.onclick = function(event) {
+            const modal = document.getElementById('addModal');
+            if (event.target == modal) {
+                closeAddModal();
+            }
+        }
+
+        // Ajouter des IDs uniques aux véhicules existants
+        vehicleData = vehicleData.map((v, index) => ({
+            ...v,
+            id: v.id || (Date.now() + index + Math.random())
+        }));
+
+        // Initialiser au chargement
+        loadGarageDimensions();
+        initTable();
+    </script>
+
+</body></html>
